@@ -1431,48 +1431,34 @@
                         </h5>
                         <div class="proxy-management">
                             <div class="proxy-lists">
-                                <div class="row">
-                                    <div class="col-md-4">
-                                        <div class="proxy-list-section">
-                                            <div class="proxy-list-header">
-                                                <i class="fa fa-globe"></i>
-                                                <span>HTTP代理</span>
-                                            </div>
-                                            <textarea class="form-control" id="http-proxy-list" rows="8" 
-                                                placeholder="每行一个地址，格式：ip:port&#10;例如：127.0.0.1:8080"></textarea>
-                                        </div>
+                                <div class="proxy-toolbar">
+                                    <div class="proxy-count">
+                                        <i class="fa fa-list"></i>
+                                        <span data-i18n="proxy_total_label">代理总数</span>：<span id="proxy-total">0</span>
+                                        <span class="proxy-count-sep">·</span>
+                                        <span data-i18n="proxy_enabled_label">已启用</span> <span id="proxy-enabled-count">0</span>
                                     </div>
-                                    <div class="col-md-4">
-                                        <div class="proxy-list-section">
-                                            <div class="proxy-list-header">
-                                                <i class="fa fa-lock"></i>
-                                                <span>HTTPS代理</span>
-                                            </div>
-                                            <textarea class="form-control" id="https-proxy-list" rows="8"
-                                                placeholder="每行一个地址，格式：ip:port&#10;例如：127.0.0.1:8443"></textarea>
-                                        </div>
-                                    </div>
-                                    <div class="col-md-4">
-                                        <div class="proxy-list-section">
-                                            <div class="proxy-list-header">
-                                                <i class="fa fa-shield"></i>
-                                                <span>SOCKS5代理</span>
-                                            </div>
-                                            <textarea class="form-control" id="socks5-proxy-list" rows="8"
-                                                placeholder="每行一个地址，格式：ip:port&#10;例如：127.0.0.1:1080"></textarea>
-                                        </div>
+                                    <div class="proxy-toolbar-actions">
+                                        <button type="button" class="btn btn-sm btn-toolbar" onclick="setAllProxies(true)">
+                                            <i class="fa fa-check-circle"></i>
+                                            <span data-i18n="enable_all_btn">全部启用</span>
+                                        </button>
+                                        <button type="button" class="btn btn-sm btn-toolbar" onclick="setAllProxies(false)">
+                                            <i class="fa fa-ban"></i>
+                                            <span data-i18n="disable_all_btn">全部禁用</span>
+                                        </button>
                                     </div>
                                 </div>
-                                <div class="mt-4">
-                                    <div class="proxy-list-section">
-                                        <div class="proxy-list-header">
-                                            <i class="fa fa-code"></i>
-                                            <span data-i18n="full_proxy">完整代理地址</span>
-                                            <div class="proxy-list-help" data-i18n="proxy_help">支持完整格式的代理地址，包含协议和认证信息</div>
-                                        </div>
-                                        <textarea class="form-control" id="full-proxy-list" rows="4"
-                                            placeholder="每行一个地址，格式：protocol://[username:password@]ip:port&#10;例如：http://user:pass@127.0.0.1:8080"></textarea>
-                                    </div>
+                                <div id="proxy-items" class="proxy-items"></div>
+                                <div id="proxy-empty" class="proxy-empty" data-i18n="proxy_empty_hint">暂无代理，请在下方添加</div>
+                                <div class="proxy-add">
+                                    <textarea class="form-control" id="proxy-add-input" rows="3"
+                                        data-i18n-placeholder="proxy_add_placeholder"
+                                        placeholder="每行一个：ip:port 或 protocol://[user:pass@]ip:port&#10;例如：http://user:pass@127.0.0.1:8080"></textarea>
+                                    <button type="button" class="btn btn-secondary proxy-add-btn" onclick="addProxies()">
+                                        <i class="fa fa-plus"></i>
+                                        <span data-i18n="add_proxy_btn">添加代理</span>
+                                    </button>
                                 </div>
                             </div>
                             <div class="mb-3 mt-4">
@@ -1737,38 +1723,128 @@
             });
         }
 
+        // ===== 代理管理：启用/禁用列表 =====
+        // 单一数据源：每项 { addr: '完整代理地址', enabled: 布尔值 }
+        let proxyItems = [];
+
+        function normalizeProxyAddr(raw) {
+            let s = (raw || '').trim();
+            if (s.startsWith('#')) s = s.replace(/^#+\s*/, '');
+            if (!s) return '';
+            // 后端要求代理带 scheme://，无协议前缀时默认按 http:// 处理
+            if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) s = 'http://' + s;
+            return s;
+        }
+
+        function proxyProtocol(addr) {
+            const m = (addr || '').match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//);
+            return m ? m[1].toLowerCase() : 'http';
+        }
+
         function loadProxies() {
             $.get(appendToken('/api/proxies'), function(data) {
-                const httpProxies = [];
-                const httpsProxies = [];
-                const socks5Proxies = [];
-                const fullProxies = [];
-                
-                data.proxies.forEach(proxy => {
-                    if (proxy.includes('@') || (proxy.includes('://') && !proxy.match(/^(http|https|socks5):\/\/[^@]+:\d+$/))) {
-                        // 带认证信息或其他完整格式的代理放入完整代理列表
-                        fullProxies.push(proxy);
-                    } else if (proxy.startsWith('http://')) {
-                        // HTTP代理
-                        httpProxies.push(proxy.replace('http://', ''));
-                    } else if (proxy.startsWith('https://')) {
-                        // HTTPS代理
-                        httpsProxies.push(proxy.replace('https://', ''));
-                    } else if (proxy.startsWith('socks5://')) {
-                        // SOCKS5代理
-                        socks5Proxies.push(proxy.replace('socks5://', ''));
-                    } else {
-                        // 没有协议前缀的默认作为HTTP代理
-                        httpProxies.push(proxy);
-                    }
-                });
-                
-                // 更新各个文本框的内容
-                document.getElementById('http-proxy-list').value = httpProxies.join('\n');
-                document.getElementById('https-proxy-list').value = httpsProxies.join('\n');
-                document.getElementById('socks5-proxy-list').value = socks5Proxies.join('\n');
-                document.getElementById('full-proxy-list').value = fullProxies.join('\n');
+                proxyItems = (data.proxies || [])
+                    .map(line => (line || '').trim())
+                    .filter(line => line.length > 0)
+                    .map(line => ({
+                        enabled: !line.startsWith('#'),
+                        addr: normalizeProxyAddr(line)
+                    }))
+                    .filter(item => item.addr);
+                renderProxyItems();
             });
+        }
+
+        function renderProxyItems() {
+            const box = document.getElementById('proxy-items');
+            const empty = document.getElementById('proxy-empty');
+            if (!box) return;
+            box.innerHTML = '';
+            proxyItems.forEach((item, idx) => {
+                const proto = proxyProtocol(item.addr);
+                const row = document.createElement('div');
+                row.className = 'proxy-item' + (item.enabled ? '' : ' disabled');
+
+                const sw = document.createElement('label');
+                sw.className = 'proxy-switch';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.checked = item.enabled;
+                cb.addEventListener('change', () => toggleProxy(idx));
+                const slider = document.createElement('span');
+                slider.className = 'proxy-slider';
+                sw.appendChild(cb);
+                sw.appendChild(slider);
+
+                const badge = document.createElement('span');
+                badge.className = 'proxy-proto proxy-proto-' + proto;
+                badge.textContent = proto.toUpperCase();
+
+                const addr = document.createElement('span');
+                addr.className = 'proxy-addr';
+                addr.textContent = item.addr;
+                addr.title = item.addr;
+
+                const del = document.createElement('button');
+                del.type = 'button';
+                del.className = 'proxy-del';
+                del.title = (translations[currentLanguage] && translations[currentLanguage].delete_btn) || '删除';
+                del.innerHTML = '<i class="fa fa-times"></i>';
+                del.addEventListener('click', () => deleteProxy(idx));
+
+                row.appendChild(sw);
+                row.appendChild(badge);
+                row.appendChild(addr);
+                row.appendChild(del);
+                box.appendChild(row);
+            });
+            if (empty) empty.style.display = proxyItems.length ? 'none' : 'block';
+            updateProxyCount();
+        }
+
+        function updateProxyCount() {
+            const total = document.getElementById('proxy-total');
+            const enabled = document.getElementById('proxy-enabled-count');
+            if (total) total.textContent = proxyItems.length;
+            if (enabled) enabled.textContent = proxyItems.filter(x => x.enabled).length;
+        }
+
+        function toggleProxy(idx) {
+            if (!proxyItems[idx]) return;
+            proxyItems[idx].enabled = !proxyItems[idx].enabled;
+            renderProxyItems();
+        }
+
+        function deleteProxy(idx) {
+            proxyItems.splice(idx, 1);
+            renderProxyItems();
+        }
+
+        function setAllProxies(enabled) {
+            proxyItems.forEach(x => x.enabled = enabled);
+            renderProxyItems();
+        }
+
+        function addProxies() {
+            const ta = document.getElementById('proxy-add-input');
+            if (!ta) return;
+            const lines = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+            let added = 0;
+            lines.forEach(line => {
+                const enabled = !line.startsWith('#');
+                const addr = normalizeProxyAddr(line);
+                if (!addr) return;
+                if (proxyItems.some(x => x.addr === addr)) return; // 去重，避免重复添加
+                proxyItems.push({ addr, enabled });
+                added++;
+            });
+            ta.value = '';
+            renderProxyItems();
+            if (added > 0) {
+                showNotification(((translations[currentLanguage] && translations[currentLanguage].proxy_added) || '已添加 {} 个代理').replace('{}', added), 'success');
+            } else {
+                showNotification((translations[currentLanguage] && translations[currentLanguage].proxy_add_none) || '没有可添加的新代理', 'info');
+            }
         }
 
         function loadIpLists() {
@@ -1823,29 +1899,9 @@
         }
 
         function saveProxies() {
-            // 获取各个代理列表的内容
-            const httpProxies = document.getElementById('http-proxy-list').value
-                .split('\n')
-                .filter(line => line.trim())
-                .map(line => `http://${line.trim()}`);
-            
-            const httpsProxies = document.getElementById('https-proxy-list').value
-                .split('\n')
-                .filter(line => line.trim())
-                .map(line => `https://${line.trim()}`);
-            
-            const socks5Proxies = document.getElementById('socks5-proxy-list').value
-                .split('\n')
-                .filter(line => line.trim())
-                .map(line => `socks5://${line.trim()}`);
-            
-            const fullProxies = document.getElementById('full-proxy-list').value
-                .split('\n')
-                .filter(line => line.trim());
-            
-            // 合并所有代理列表
-            const allProxies = [...httpProxies, ...httpsProxies, ...socks5Proxies, ...fullProxies];
-            
+            // 从统一列表构建；禁用项写为以 # 开头的注释行，后端加载时会跳过
+            const allProxies = proxyItems.map(item => item.enabled ? item.addr : '#' + item.addr);
+
             // 获取测试URL
             const testUrl = document.getElementById('test-target-url').value.trim();
             
@@ -2346,6 +2402,17 @@
                     'socks5': '每行一个地址，格式：ip:port\n例如：127.0.0.1:1080',
                     'full': '每行一个地址，格式：protocol://[username:password@]ip:port\n例如：http://user:pass@127.0.0.1:8080'
                 },
+                'proxy_total_label': '代理总数',
+                'proxy_enabled_label': '已启用',
+                'proxy_disabled_label': '已禁用',
+                'enable_all_btn': '全部启用',
+                'disable_all_btn': '全部禁用',
+                'add_proxy_btn': '添加代理',
+                'delete_btn': '删除',
+                'proxy_empty_hint': '暂无代理，请在下方添加',
+                'proxy_add_placeholder': '每行一个：ip:port 或 protocol://[user:pass@]ip:port\n例如：http://user:pass@127.0.0.1:8080',
+                'proxy_added': '已添加 {} 个代理',
+                'proxy_add_none': '没有可添加的新代理',
                 'save_proxy_btn': '保存代理',
                 'check_proxy_btn': '检测代理',
                 'checking_proxy': '检测中...',
@@ -2554,6 +2621,17 @@
                     'socks5': 'One address per line, format: ip:port\nExample: 127.0.0.1:1080',
                     'full': 'One address per line, format: protocol://[username:password@]ip:port\nExample: http://user:pass@127.0.0.1:8080'
                 },
+                'proxy_total_label': 'Total',
+                'proxy_enabled_label': 'Enabled',
+                'proxy_disabled_label': 'Disabled',
+                'enable_all_btn': 'Enable All',
+                'disable_all_btn': 'Disable All',
+                'add_proxy_btn': 'Add Proxy',
+                'delete_btn': 'Delete',
+                'proxy_empty_hint': 'No proxies yet. Add some below.',
+                'proxy_add_placeholder': 'One per line: ip:port or protocol://[user:pass@]ip:port\nExample: http://user:pass@127.0.0.1:8080',
+                'proxy_added': 'Added {} proxy(ies)',
+                'proxy_add_none': 'No new proxies to add',
                 'save_proxy_btn': 'Save Proxies',
                 'check_proxy_btn': 'Check Proxies',
                 'checking_proxy': 'Checking...',
@@ -2592,44 +2670,8 @@
             // 更新日志级别选项
             updateLogLevelOptions();
 
-            // 更新代理列表标题
-            const proxyHeaders = document.querySelectorAll('.proxy-list-header span');
-            proxyHeaders.forEach(header => {
-                const headerText = header.textContent.toLowerCase();
-                if (headerText.includes('http') && !headerText.includes('https')) {
-                    header.textContent = translations[language].http_proxy;
-                } else if (headerText.includes('https')) {
-                    header.textContent = translations[language].https_proxy;
-                } else if (headerText.includes('socks5')) {
-                    header.textContent = translations[language].socks5_proxy;
-                }
-            });
-
-            // 更新代理列表占位符
-            document.getElementById('http-proxy-list').setAttribute('placeholder', translations[language].proxy_placeholder.http);
-            document.getElementById('https-proxy-list').setAttribute('placeholder', translations[language].proxy_placeholder.https);
-            document.getElementById('socks5-proxy-list').setAttribute('placeholder', translations[language].proxy_placeholder.socks5);
-            
-            // 更新帮助文本
-            const helpText = document.querySelector('.proxy-list-help');
-            if (helpText) {
-                helpText.textContent = translations[language].proxy_help;
-            }
-
-            // 更新占位符文本
-            const placeholders = {
-                'http-proxy-list': translations[language].proxy_placeholder.http,
-                'https-proxy-list': translations[language].proxy_placeholder.https,
-                'socks5-proxy-list': translations[language].proxy_placeholder.socks5,
-                'full-proxy-list': translations[language].proxy_placeholder.full
-            };
-
-            Object.entries(placeholders).forEach(([id, text]) => {
-                const element = document.getElementById(id);
-                if (element) {
-                    element.setAttribute('placeholder', text);
-                }
-            });
+            // 语言切换后刷新代理列表，更新删除按钮等提示文案
+            renderProxyItems();
 
             // 更新按钮文本
             const saveBtn = document.querySelector('.proxy-actions .btn-primary span');

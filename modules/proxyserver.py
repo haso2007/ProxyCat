@@ -8,7 +8,8 @@ from configparser import ConfigParser
 
 def load_proxies(file_path='ip.txt'):
     with open(file_path, 'r') as file:
-        return [line.strip() for line in file if '://' in line]
+        return [line.strip() for line in file
+                if '://' in line and not line.strip().startswith('#')]
 
 def validate_proxy(proxy):
     pattern = re.compile(r'^(?P<scheme>socks5|http|https)://(?:(?P<auth>[^@]+)@)?(?P<host>[^:]+):(?P<port>\d+)$')
@@ -179,7 +180,8 @@ class AsyncProxyServer:
             proxy_file = os.path.join('config', os.path.basename(self.proxy_file))
             if os.path.exists(proxy_file):
                 with open(proxy_file, 'r', encoding='utf-8') as f:
-                    proxies = [line.strip() for line in f if line.strip()]
+                    proxies = [line.strip() for line in f
+                               if line.strip() and not line.strip().startswith('#')]
                 return proxies
             else:
                 logging.error(get_message('proxy_file_not_found', self.language, proxy_file))

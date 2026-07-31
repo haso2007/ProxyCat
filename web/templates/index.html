@@ -1485,6 +1485,30 @@
                                 <input type="text" class="form-control" id="test-target-url" placeholder="https://www.baidu.com">
                                 <div class="form-text" data-i18n="test_url_help">用于检测代理有效性的目标地址</div>
                             </div>
+                            <div class="proxy-health-settings">
+                                <div class="proxy-health-field">
+                                    <label class="form-label" for="proxy-check-timeout" data-i18n="proxy_check_timeout_label">检测超时（ms）</label>
+                                    <input type="number" class="form-control" id="proxy-check-timeout" min="200" max="60000" step="100" value="2000" onchange="saveHealthCheckConfig()">
+                                </div>
+                                <div class="proxy-health-toggle">
+                                    <div class="form-check form-switch">
+                                        <input class="form-check-input" type="checkbox" id="auto-check-enabled" onchange="toggleAutoCheckControls(); saveHealthCheckConfig()">
+                                        <label class="form-check-label" for="auto-check-enabled" data-i18n="auto_check_enabled_label">启用自动检测</label>
+                                    </div>
+                                </div>
+                                <div class="proxy-health-field">
+                                    <label class="form-label" for="auto-check-interval" data-i18n="auto_check_interval_label">自动检测周期（分钟）</label>
+                                    <input type="number" class="form-control" id="auto-check-interval" min="1" max="10080" step="1" value="60" disabled onchange="saveHealthCheckConfig()">
+                                </div>
+                                <div class="proxy-health-toggle">
+                                    <div class="form-check form-switch">
+                                        <input class="form-check-input" type="checkbox" id="auto-disable-failed" onchange="saveHealthCheckConfig()">
+                                        <label class="form-check-label" for="auto-disable-failed" data-i18n="auto_disable_failed_label">自动禁用失败代理</label>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="form-text proxy-health-help" data-i18n="auto_disable_failed_help">启用后，手动或自动检测中超时、连接失败的代理会被禁用。</div>
+                            <div id="auto-check-status" class="proxy-auto-check-status"></div>
                             <div class="proxy-actions">
                                 <button class="btn btn-warning" id="check-proxy-btn" onclick="checkProxies('enabled')">
                                     <i class="fa fa-check-circle"></i>
@@ -1711,6 +1735,7 @@
 
                 // 更新按钮状态
                 updateServiceButtons(status);
+                updateAutoCheckStatus(data.auto_check);
             });
         }
 
@@ -1756,7 +1781,14 @@
                     $('input[name="blacklist_file"]').val(config.blacklist_file || '');
                     $('select[name="ip_auth_priority"]').val(config.ip_auth_priority || 'whitelist');
                     $('select[name="display_level"]').val(config.display_level || '1');
-                    
+                    $('#test-target-url').val(config.test_url || 'https://www.baidu.com');
+                    $('#proxy-check-timeout').val(config.proxy_check_timeout_ms || '2000');
+                    $('#auto-check-enabled').prop('checked', (config.auto_check_enabled || '').toLowerCase() === 'true');
+                    $('#auto-check-interval').val(config.auto_check_interval_minutes || '60');
+                    $('#auto-disable-failed').prop('checked', (config.auto_disable_failed_proxies || '').toLowerCase() === 'true');
+                    toggleAutoCheckControls();
+                    updateAutoCheckStatus(data.auto_check);
+
                     // 根据 use_getip 的状态更新 getip_url 输入框的禁用状态
                     const useGetip = (config.use_getip || '').toLowerCase() === 'true';
                     $('input[name="getip_url"]').prop('disabled', !useGetip);
@@ -1767,6 +1799,64 @@
                     // 更新地址显示
                     updateAddresses(config);
                 }
+            });
+        }
+
+        function toggleAutoCheckControls() {
+            const enabled = $('#auto-check-enabled').prop('checked');
+            $('#auto-check-interval').prop('disabled', !enabled);
+        }
+
+        function updateAutoCheckStatus(autoCheck) {
+            const box = document.getElementById('auto-check-status');
+            if (!box) return;
+            if (!autoCheck || !autoCheck.enabled) {
+                box.textContent = tProxy('auto_check_status_disabled', '自动检测未启用');
+                return;
+            }
+            const summary = autoCheck.summary;
+            let text = tProxy('auto_check_status_enabled', '自动检测已启用，每 {} 分钟执行一次')
+                .replace('{}', autoCheck.interval_minutes || 60);
+            if (summary) {
+                text += ' · ' + tProxy('auto_check_status_summary', '上次：成功 {} / 失败 {} / 禁用 {}')
+                    .replace('{}', summary.valid || 0)
+                    .replace('{}', summary.failed || 0)
+                    .replace('{}', summary.disabled || 0);
+            }
+            box.textContent = text;
+        }
+
+        function saveHealthCheckConfig() {
+            const timeout = Number($('#proxy-check-timeout').val());
+            const interval = Number($('#auto-check-interval').val());
+            if (!Number.isFinite(timeout) || timeout < 200 || timeout > 60000) {
+                showNotification(tProxy('proxy_check_timeout_invalid', '检测超时应在 200 到 60000 ms 之间'), 'error');
+                return;
+            }
+            if (!Number.isFinite(interval) || interval < 1 || interval > 10080) {
+                showNotification(tProxy('auto_check_interval_invalid', '自动检测周期应在 1 到 10080 分钟之间'), 'error');
+                return;
+            }
+            $.ajax({
+                url: appendToken('/api/config'),
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({
+                    test_url: getProxyTestUrl(),
+                    proxy_check_timeout_ms: timeout,
+                    auto_check_enabled: $('#auto-check-enabled').prop('checked'),
+                    auto_check_interval_minutes: interval,
+                    auto_disable_failed_proxies: $('#auto-disable-failed').prop('checked')
+                })
+            }).done(function(response) {
+                if (response.status === 'success') {
+                    showNotification(tProxy('health_check_config_saved', '检测设置已保存'), 'success');
+                    updateStatus();
+                } else {
+                    showNotification(response.message || tProxy('config_save_failed', '配置保存失败'), 'error');
+                }
+            }).fail(function(xhr) {
+                showNotification((xhr.responseJSON && xhr.responseJSON.message) || tProxy('config_save_failed', '配置保存失败'), 'error');
             });
         }
 
@@ -2067,6 +2157,33 @@
             });
         }
 
+        function autoDisableFailedProxies(addresses) {
+            if (!$('#auto-disable-failed').prop('checked') || !addresses.length) return;
+            $.ajax({
+                url: appendToken('/api/disable_proxies'),
+                method: 'POST',
+                contentType: 'application/json',
+                data: JSON.stringify({ proxies: addresses })
+            }).done(function(data) {
+                if (data.status === 'success' && data.disabled) {
+                    addresses.forEach(addr => {
+                        const item = proxyItems.find(x => x.addr === addr);
+                        if (item) item.enabled = false;
+                    });
+                    renderProxyItems();
+                    appendProxyCheckLog(
+                        tProxy('auto_disable_log', '已自动禁用 {} 个失败代理').replace('{}', data.disabled),
+                        'info'
+                    );
+                }
+            }).fail(function(xhr) {
+                appendProxyCheckLog(
+                    tProxy('auto_disable_failed_log', '自动禁用失败：{}').replace('{}', (xhr.responseJSON && xhr.responseJSON.message) || xhr.responseText || ''),
+                    'fail'
+                );
+            });
+        }
+
         function formatCheckResultLog(addr, data, ok) {
             const ms = (data && data.elapsed_ms != null) ? ` [${data.elapsed_ms}ms]` : '';
             const err = (!ok && data && data.error) ? ` — ${data.error}` : '';
@@ -2099,6 +2216,7 @@
                     const ok = applyProxyCheckResult(item, data);
                     updateProxyTestButton(idx);
                     appendProxyCheckLog(formatCheckResultLog(item.addr, data, ok), ok ? 'ok' : 'fail');
+                    if (!ok) autoDisableFailedProxies([item.addr]);
                 })
                 .fail(function(xhr) {
                     item.checkStatus = 'fail';
@@ -2280,6 +2398,7 @@
             appendProxyCheckLog(startMsg.replace('{}', items.length), 'info');
 
             let stopped = false;
+            const failedAddresses = [];
 
             for (let i = 0; i < items.length; i++) {
                 if (proxyCheckCtl.stopRequested) {
@@ -2318,6 +2437,7 @@
                         // 停止时若请求已返回，仍记录结果
                         const ok = applyProxyCheckResult(item, data);
                         if (ok) proxyCheckCtl.okCount++; else proxyCheckCtl.failCount++;
+                        if (!ok) failedAddresses.push(item.addr);
                         updateProxyTestButton(idx);
                         appendProxyCheckLog(formatCheckResultLog(item.addr, data, ok), ok ? 'ok' : 'fail');
                         proxyCheckCtl.done++;
@@ -2326,6 +2446,7 @@
                     }
                     const ok = applyProxyCheckResult(item, data);
                     if (ok) proxyCheckCtl.okCount++; else proxyCheckCtl.failCount++;
+                    if (!ok) failedAddresses.push(item.addr);
                     updateProxyTestButton(idx);
                     appendProxyCheckLog(formatCheckResultLog(item.addr, data, ok), ok ? 'ok' : 'fail');
                 } catch (e) {
@@ -2345,6 +2466,7 @@
                     }
                     item.checkStatus = 'fail';
                     item.checkLatency = null;
+                    failedAddresses.push(item.addr);
                     proxyCheckCtl.failCount++;
                     updateProxyTestButton(idx);
                     appendProxyCheckLog(
@@ -2356,6 +2478,10 @@
 
                 proxyCheckCtl.done++;
                 updateCheckProgress();
+            }
+
+            if (failedAddresses.length) {
+                autoDisableFailedProxies([...new Set(failedAddresses)]);
             }
 
             const okCount = proxyCheckCtl.okCount;
@@ -2721,7 +2847,11 @@
                 blacklist_file: $('input[name="blacklist_file"]').val(),
                 ip_auth_priority: $('select[name="ip_auth_priority"]').val(),
                 display_level: $('select[name="display_level"]').val(),
-                test_url: $('input[name="test_url"]').val()
+                test_url: $('#test-target-url').val(),
+                proxy_check_timeout_ms: $('#proxy-check-timeout').val(),
+                auto_check_enabled: $('#auto-check-enabled').prop('checked').toString(),
+                auto_check_interval_minutes: $('#auto-check-interval').val(),
+                auto_disable_failed_proxies: $('#auto-disable-failed').prop('checked').toString()
             };
 
             // 保存配置
@@ -3045,6 +3175,19 @@
                 'check_progress_text': '进度 {}/{}（成功 {} / 失败 {}）',
                 'check_busy': '批量检测进行中，请先暂停/停止',
                 'proxy_test_btn': '测试连通性',
+                'proxy_check_timeout_label': '检测超时（ms）',
+                'proxy_check_timeout_invalid': '检测超时应在 200 到 60000 ms 之间',
+                'auto_check_enabled_label': '启用自动检测',
+                'auto_check_interval_label': '自动检测周期（分钟）',
+                'auto_check_interval_invalid': '自动检测周期应在 1 到 10080 分钟之间',
+                'auto_disable_failed_label': '自动禁用失败代理',
+                'auto_disable_failed_help': '启用后，手动或自动检测中超时、连接失败的代理会被禁用。',
+                'auto_check_status_disabled': '自动检测未启用',
+                'auto_check_status_enabled': '自动检测已启用，每 {} 分钟执行一次',
+                'auto_check_status_summary': '上次：成功 {} / 失败 {} / 禁用 {}',
+                'health_check_config_saved': '检测设置已保存',
+                'auto_disable_log': '已自动禁用 {} 个失败代理',
+                'auto_disable_failed_log': '自动禁用失败：{}',
                 'proxy_check_log_title': '检测日志',
                 'clear_check_log_btn': '清空',
                 'proxy_check_log_empty': '暂无检测记录',
@@ -3300,6 +3443,19 @@
                 'check_progress_text': 'Progress {}/{} (OK {} / FAIL {})',
                 'check_busy': 'Bulk check in progress — pause/stop first',
                 'proxy_test_btn': 'Test connectivity',
+                'proxy_check_timeout_label': 'Check timeout (ms)',
+                'proxy_check_timeout_invalid': 'Check timeout must be between 200 and 60000 ms',
+                'auto_check_enabled_label': 'Enable automatic checks',
+                'auto_check_interval_label': 'Auto-check interval (minutes)',
+                'auto_check_interval_invalid': 'Auto-check interval must be between 1 and 10080 minutes',
+                'auto_disable_failed_label': 'Automatically disable failed proxies',
+                'auto_disable_failed_help': 'When enabled, proxies that time out or fail during manual or automatic checks are disabled.',
+                'auto_check_status_disabled': 'Automatic checks are disabled',
+                'auto_check_status_enabled': 'Automatic checks are enabled every {} minute(s)',
+                'auto_check_status_summary': 'Last run: OK {} / FAIL {} / disabled {}',
+                'health_check_config_saved': 'Check settings saved',
+                'auto_disable_log': 'Automatically disabled {} failed proxy(ies)',
+                'auto_disable_failed_log': 'Automatic disable failed: {}',
                 'proxy_check_log_title': 'Check Log',
                 'clear_check_log_btn': 'Clear',
                 'proxy_check_log_empty': 'No check records yet',
@@ -3377,6 +3533,7 @@
                 
                 // 更新按钮状态
                 updateServiceButtons(status);
+                updateAutoCheckStatus(data.auto_check);
                 
                 // 确保在DOM加载完成后更新
                 if (document.readyState === 'loading') {

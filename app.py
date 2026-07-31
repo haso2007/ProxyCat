@@ -12,7 +12,7 @@ from functools import wraps
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ProxyCat import run_server
-from modules.modules import load_config, check_proxies, check_proxy, check_proxy_detailed, get_message, load_ip_list, normalize_proxy_address, validate_proxy_format
+from modules.modules import load_config, check_proxies, check_proxy, check_proxy_detailed, get_message, load_ip_list, normalize_proxy_address, validate_proxy_format, normalized_check_timeout_ms
 from modules.proxyserver import AsyncProxyServer
 import asyncio
 import threading
@@ -30,6 +30,31 @@ server = AsyncProxyServer(config)
 
 def get_config_path(filename):
     return os.path.join('config', filename)
+
+
+def parse_config_bool(value, field_name):
+    if isinstance(value, bool):
+        return value
+    if str(value).lower() in ('true', 'false'):
+        return str(value).lower() == 'true'
+    raise ValueError(f'{field_name} must be true or false')
+
+
+def validate_health_check_config(new_config):
+    """Validate health-check values before writing config.ini."""
+    if 'proxy_check_timeout_ms' in new_config:
+        value = int(new_config['proxy_check_timeout_ms'])
+        if not 200 <= value <= 60000:
+            raise ValueError('proxy_check_timeout_ms must be between 200 and 60000')
+        new_config['proxy_check_timeout_ms'] = value
+    if 'auto_check_interval_minutes' in new_config:
+        value = int(new_config['auto_check_interval_minutes'])
+        if not 1 <= value <= 10080:
+            raise ValueError('auto_check_interval_minutes must be between 1 and 10080')
+        new_config['auto_check_interval_minutes'] = value
+    for field in ('auto_check_enabled', 'auto_disable_failed_proxies'):
+        if field in new_config:
+            new_config[field] = parse_config_bool(new_config[field], field)
 
 log_file = 'logs/proxycat.log'
 os.makedirs('logs', exist_ok=True)
@@ -138,17 +163,24 @@ def get_status():
         'auth_required': server.auth_required,
         'display_level': int(server_config.get('display_level', '1')),
         'service_status': 'running' if server.running else 'stopped',
+        'auto_check': server.auto_check_status() if hasattr(server, 'auto_check_status') else {},
         'config': server_config
     })
 
 @app.route('/api/config', methods=['POST'])
+@require_token
 def save_config():
     try:
-        new_config = request.get_json()
+        new_config = request.get_json() or {}
+        validate_health_check_config(new_config)
         current_config = load_config('config/config.ini')
-        port_changed = str(new_config.get('port', '')) != str(current_config.get('port', ''))
-        mode_changed = new_config.get('mode', '') != current_config.get('mode', '')
-        use_getip_changed = (new_config.get('use_getip', 'False').lower() == 'true') != (current_config.get('use_getip', 'False').lower() == 'true')
+        port_changed = 'port' in new_config and str(new_config['port']) != str(current_config.get('port', ''))
+        mode_changed = 'mode' in new_config and new_config['mode'] != current_config.get('mode', '')
+        use_getip_changed = (
+            'use_getip' in new_config
+            and (str(new_config['use_getip']).lower() == 'true')
+            != (current_config.get('use_getip', 'False').lower() == 'true')
+        )
         
         config_parser = ConfigParser()
         config_parser.read('config/config.ini', encoding='utf-8')
@@ -170,8 +202,8 @@ def save_config():
         
         server.config = load_config('config/config.ini')
         server._init_config_values(server.config)
-        
-        
+        server.refresh_auto_check_task()
+
         if mode_changed or use_getip_changed:
             server._handle_mode_change()
             
@@ -194,6 +226,7 @@ def save_config():
         })
 
 @app.route('/api/proxies', methods=['GET', 'POST'])
+@require_token
 def handle_proxies():
     if request.method == 'POST':
         try:
@@ -249,7 +282,26 @@ def handle_proxies():
         except Exception:
             return jsonify({'proxies': []})
 
+@app.route('/api/disable_proxies', methods=['POST'])
+@require_token
+def disable_proxies_api():
+    """Persistently disable failed proxy entries when the policy is enabled."""
+    try:
+        if not getattr(server, 'auto_disable_failed_proxies', False):
+            return jsonify({
+                'status': 'error',
+                'message': 'automatic proxy disabling is disabled'
+            }), 409
+        data = request.get_json(silent=True) or {}
+        proxies = data.get('proxies') or []
+        disabled = server.disable_proxy_addresses(proxies)
+        return jsonify({'status': 'success', 'disabled': disabled})
+    except Exception as e:
+        logging.exception('disable_proxies api failed')
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 @app.route('/api/check_proxy', methods=['POST'])
+@require_token
 def check_single_proxy_api():
     """检测单个代理连通性，供前端逐条测试使用。"""
     try:
@@ -265,12 +317,16 @@ def check_single_proxy_api():
                 'message': get_message('proxy_check_failed', server.language, 'empty proxy')
             }), 400
 
-        detail = asyncio.run(check_proxy_detailed(proxy, test_url, force=force))
+        timeout_ms = getattr(server, 'proxy_check_timeout_ms', 2000)
+        detail = asyncio.run(check_proxy_detailed(proxy, test_url, force=force, timeout_ms=timeout_ms))
         return jsonify({
             'status': 'success',
             'proxy': proxy,
             'valid': bool(detail.get('valid')),
             'error': detail.get('error'),
+            'timed_out': bool(detail.get('timed_out')),
+            'error_code': detail.get('error_code'),
+            'timeout_ms': detail.get('timeout_ms', timeout_ms),
             'elapsed_ms': detail.get('elapsed_ms', 0),
             'test_url': test_url,
             'cached': bool(detail.get('cached')),
@@ -285,6 +341,7 @@ def check_single_proxy_api():
         })
 
 @app.route('/api/check_proxies', methods=['GET', 'POST'])
+@require_token
 def check_proxies_api():
     try:
         if request.method == 'POST':
@@ -299,16 +356,19 @@ def check_proxies_api():
             proxies = list(server.proxies or [])
             force = True
 
+        timeout_ms = getattr(server, 'proxy_check_timeout_ms', 2000)
         results = []
         valid_proxies = []
         for proxy in proxies:
             proxy = (proxy or '').strip()
             if not proxy or proxy.startswith('#'):
                 continue
-            detail = asyncio.run(check_proxy_detailed(proxy, test_url, force=force))
+            detail = asyncio.run(check_proxy_detailed(proxy, test_url, force=force, timeout_ms=timeout_ms))
             item = {
                 'proxy': proxy,
                 'valid': bool(detail.get('valid')),
+                'timed_out': bool(detail.get('timed_out')),
+                'error_code': detail.get('error_code'),
                 'error': detail.get('error'),
                 'elapsed_ms': detail.get('elapsed_ms', 0),
             }

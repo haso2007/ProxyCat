@@ -1,5 +1,5 @@
-import asyncio, httpx, logging, re, socket, struct, time, base64, random, os
-from modules.modules import get_message, load_ip_list, normalize_proxy_address, validate_proxy_format, PROXY_SCHEME_ALIASES
+import asyncio, httpx, logging, re, socket, struct, time, base64, random, os, threading, tempfile
+from modules.modules import get_message, load_ip_list, normalize_proxy_address, validate_proxy_format, PROXY_SCHEME_ALIASES, normalized_check_timeout_ms
 from asyncio import TimeoutError
 from itertools import cycle
 from config import getip
@@ -59,6 +59,18 @@ class AsyncProxyServer:
         self.ip_auth_priority = config.get('ip_auth_priority', 'whitelist')
         
         self.test_url = config.get('test_url', 'https://www.baidu.com')
+        # 健康检测设置
+        self.proxy_check_timeout_ms = normalized_check_timeout_ms(
+            config.get('proxy_check_timeout_ms', '2000')
+        )
+        self.auto_check_enabled = config.get('auto_check_enabled', 'false').lower() == 'true'
+        self.auto_check_interval_minutes = max(
+            1,
+            int(config.get('auto_check_interval_minutes', '60') or '60')
+        )
+        self.auto_disable_failed_proxies = config.get(
+            'auto_disable_failed_proxies', 'false'
+        ).lower() == 'true'
         self.whitelist = load_ip_list(self.whitelist_file)
         self.blacklist = load_ip_list(self.blacklist_file)
         
@@ -73,8 +85,17 @@ class AsyncProxyServer:
         self.proxy_check_ttl = 60
         self.check_cooldown = 10
         self.connected_clients = set()
-        self.last_proxy_failure_time = 0  
-        self.proxy_failure_cooldown = 3  
+        self.last_proxy_failure_time = 0
+        self.proxy_failure_cooldown = 3
+        # 自动健康检测状态仅在实例首次初始化时创建；热更新配置不得重置任务/锁。
+        if not hasattr(self, '_auto_check_lock'):
+            self._auto_check_task = None
+            self._auto_check_lock = asyncio.Lock()
+            self._proxy_file_lock = threading.RLock()
+            self._last_auto_check_at = None
+            self._last_auto_check_summary = None
+            self._auto_check_wakeup = asyncio.Event()
+            self._event_loop = None
 
     def _init_server_state(self):
         self.running = False
@@ -205,6 +226,155 @@ class AsyncProxyServer:
             logging.error(get_message('load_proxy_file_error', self.language, str(e)))
             return []
 
+    def disable_proxy_addresses(self, addresses):
+        """将指定的已启用代理行注释为禁用，保留其它行及已有注释。"""
+        addresses = {
+            normalize_proxy_address(addr).lstrip('#')
+            for addr in addresses
+            if addr
+        }
+        if not addresses:
+            return 0
+
+        with self._proxy_file_lock:
+            if not os.path.exists(self.proxy_file):
+                return 0
+            with open(self.proxy_file, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+
+            changed = 0
+            updated = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#'):
+                    normalized = normalize_proxy_address(stripped)
+                    if normalized in addresses:
+                        updated.append('#' + stripped)
+                        changed += 1
+                        continue
+                updated.append(line)
+
+            if not changed:
+                return 0
+
+            directory = os.path.dirname(os.path.abspath(self.proxy_file))
+            fd, temp_path = tempfile.mkstemp(prefix='.proxycat-', dir=directory, text=True)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+                    f.write('\n'.join(updated) + '\n')
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, self.proxy_file)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+            self.proxies = self._load_file_proxies()
+            self.proxy_cycle = cycle(self.proxies) if self.proxies else None
+            self.current_proxy = next(self.proxy_cycle) if self.proxy_cycle else None
+            logging.warning(f'自动禁用 {changed} 个检测失败代理')
+            return changed
+
+    async def _run_auto_check(self):
+        if self.use_getip or not self.auto_check_enabled:
+            return
+        async with self._auto_check_lock:
+            enabled_proxies = list(self.proxies)
+            if not enabled_proxies:
+                self._last_auto_check_summary = {
+                    'checked': 0, 'valid': 0, 'failed': 0, 'disabled': 0
+                }
+                return
+
+            semaphore = asyncio.Semaphore(5)
+
+            async def probe(proxy):
+                async with semaphore:
+                    from modules.modules import check_proxy_detailed
+                    return proxy, await check_proxy_detailed(
+                        proxy,
+                        test_url=self.test_url,
+                        force=True,
+                        timeout_ms=self.proxy_check_timeout_ms,
+                    )
+
+            results = await asyncio.gather(*(probe(proxy) for proxy in enabled_proxies))
+            failed = [proxy for proxy, result in results if not result.get('valid')]
+            disabled = 0
+            if self.auto_disable_failed_proxies and failed:
+                disabled = self.disable_proxy_addresses(failed)
+
+            self._last_auto_check_at = time.time()
+            self._last_auto_check_summary = {
+                'checked': len(results),
+                'valid': len(results) - len(failed),
+                'failed': len(failed),
+                'disabled': disabled,
+            }
+            logging.info(
+                '自动代理检测完成: 检测 %s，成功 %s，失败 %s，禁用 %s',
+                len(results), len(results) - len(failed), len(failed), disabled
+            )
+
+    async def _auto_check_loop(self):
+        while self.running and self.auto_check_enabled and not self.use_getip:
+            try:
+                self._auto_check_wakeup.clear()
+                await asyncio.wait_for(
+                    self._auto_check_wakeup.wait(),
+                    timeout=self.auto_check_interval_minutes * 60,
+                )
+                continue
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+
+            if self.running and self.auto_check_enabled and not self.use_getip:
+                try:
+                    await self._run_auto_check()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logging.error(f'自动代理检测出错: {e}')
+
+    async def _configure_auto_check_task(self):
+        old_task = self._auto_check_task
+        if old_task and not old_task.done():
+            old_task.cancel()
+            if old_task is not asyncio.current_task():
+                await asyncio.gather(old_task, return_exceptions=True)
+        self._auto_check_task = None
+
+        if self.running and self.auto_check_enabled and not self.use_getip:
+            task = asyncio.create_task(self._auto_check_loop())
+            self._auto_check_task = task
+            self.tasks.add(task)
+            task.add_done_callback(self.tasks.discard)
+
+    def refresh_auto_check_task(self):
+        """供 Flask 配置写入后安全刷新自动检测任务。"""
+        if not self._event_loop or not self.running:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._configure_auto_check_task(),
+                self._event_loop,
+            )
+        except RuntimeError:
+            pass
+
+    def auto_check_status(self):
+        return {
+            'enabled': self.auto_check_enabled and not self.use_getip,
+            'interval_minutes': self.auto_check_interval_minutes,
+            'timeout_ms': self.proxy_check_timeout_ms,
+            'auto_disable': self.auto_disable_failed_proxies,
+            'running': bool(self._auto_check_task and not self._auto_check_task.done()),
+            'last_run_at': self._last_auto_check_at,
+            'summary': self._last_auto_check_summary,
+        }
+
     async def start(self):
         if not self.running:
             self.stop_server = False
@@ -234,11 +404,13 @@ class AsyncProxyServer:
                 )
                 
                 self.server_instance = server
+                self._event_loop = asyncio.get_running_loop()
                 logging.info(get_message('server_running', self.language, '0.0.0.0', self.port))
-                
+
                 self.tasks.add(asyncio.create_task(self.cleanup_clients()))
                 self.tasks.add(asyncio.create_task(self._cleanup_pool()))
                 self.tasks.add(asyncio.create_task(self.cleanup_disconnected_ips()))
+                await self._configure_auto_check_task()
                 
                 if hasattr(os, 'sched_setaffinity'):
                     try:

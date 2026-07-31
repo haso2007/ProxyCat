@@ -1863,6 +1863,17 @@
         // ===== 代理管理：启用/禁用列表 =====
         // 单一数据源：每项 { addr, enabled, selected }
         let proxyItems = [];
+        // 多浏览器共享检测状态
+        let lastProxyCheckLogId = 0;
+        let lastProxyCheckLogClearId = 0;
+        let lastProxyCheckRevision = 0;
+        let proxyCheckSyncTimer = null;
+        // 本页刚写入、尚未拿到服务端 id 的日志指纹，避免轮询重复插入
+        const pendingLocalCheckLogs = new Set();
+
+        function proxyCheckLogFingerprint(message, level) {
+            return `${level || 'info'}|${message || ''}`;
+        }
 
         // 协议别名 → 引擎标准协议（与后端 modules.PROXY_SCHEME_ALIASES 对齐）
         const PROXY_SCHEME_ALIASES = {
@@ -1958,7 +1969,7 @@
 
         function loadProxies() {
             $.get(appendToken('/api/proxies'), function(data) {
-                // 保留已有检测状态（按地址）
+                // 保留已有检测状态（按地址）；服务端结果优先用于跨浏览器恢复
                 const prevStatus = {};
                 proxyItems.forEach(item => {
                     if (item.addr && item.checkStatus) {
@@ -1968,17 +1979,28 @@
                         };
                     }
                 });
+                const serverResults = data.check_results || {};
                 proxyItems = (data.proxies || [])
                     .map(line => (line || '').trim())
                     .filter(line => line.length > 0)
                     .map(line => {
                         const addr = normalizeProxyAddr(line);
+                        const server = serverResults[addr];
+                        let checkStatus = prevStatus[addr] ? prevStatus[addr].status : null;
+                        let checkLatency = prevStatus[addr] ? prevStatus[addr].latency : null;
+                        if (server && server.status) {
+                            // 本地正在 testing 时不覆盖，避免闪烁
+                            if (checkStatus !== 'testing') {
+                                checkStatus = server.status;
+                                checkLatency = server.valid ? Number(server.elapsed_ms) : null;
+                            }
+                        }
                         return {
                             enabled: !line.startsWith('#'),
                             selected: false,
                             addr,
-                            checkStatus: prevStatus[addr] ? prevStatus[addr].status : null, // null | testing | ok | fail
-                            checkLatency: prevStatus[addr] ? prevStatus[addr].latency : null
+                            checkStatus, // null | testing | ok | fail
+                            checkLatency
                         };
                     })
                     .filter(item => item.addr);
@@ -2114,27 +2136,135 @@
             return ((el && el.value) || '').trim() || 'https://www.baidu.com';
         }
 
-        function appendProxyCheckLog(message, level) {
+        function applyServerCheckResults(results) {
+            if (!results || typeof results !== 'object') return false;
+            let changed = false;
+            proxyItems.forEach((item, idx) => {
+                if (!item || !item.addr) return;
+                // 本页正在测这一条时，不拿远端结果打断本地 testing 态
+                if (item.checkStatus === 'testing') return;
+                const remote = results[item.addr];
+                if (!remote || !remote.status) return;
+                const nextStatus = remote.status === 'ok' ? 'ok' : 'fail';
+                const nextLatency = nextStatus === 'ok' && remote.elapsed_ms != null
+                    ? Number(remote.elapsed_ms)
+                    : null;
+                if (item.checkStatus !== nextStatus || item.checkLatency !== nextLatency) {
+                    item.checkStatus = nextStatus;
+                    item.checkLatency = nextLatency;
+                    updateProxyTestButton(idx);
+                    changed = true;
+                }
+            });
+            return changed;
+        }
+
+        function appendProxyCheckLog(message, level, options = {}) {
             const box = document.getElementById('proxy-check-log');
             if (!box) return;
+            const { sync = true, time = null, id = null } = options;
             if (box.dataset.empty === '1' || box.querySelector('.proxy-check-log-placeholder')) {
                 box.innerHTML = '';
                 box.dataset.empty = '0';
             }
-            const time = new Date().toLocaleTimeString();
+            const displayTime = time || new Date().toLocaleTimeString();
             const line = document.createElement('div');
             line.className = 'proxy-check-log-line' + (level ? ' is-' + level : '');
-            line.innerHTML = `<span class="proxy-check-log-time">${time}</span><span class="proxy-check-log-msg"></span>`;
+            if (id != null) line.dataset.logId = String(id);
+            line.innerHTML = `<span class="proxy-check-log-time"></span><span class="proxy-check-log-msg"></span>`;
+            line.querySelector('.proxy-check-log-time').textContent = displayTime;
             line.querySelector('.proxy-check-log-msg').textContent = message;
             box.appendChild(line);
             box.scrollTop = box.scrollHeight;
+
+            if (id != null) {
+                lastProxyCheckLogId = Math.max(lastProxyCheckLogId, Number(id) || 0);
+            }
+
+            // 推到服务端，其他浏览器可轮询到
+            if (sync) {
+                const fp = proxyCheckLogFingerprint(message, level);
+                pendingLocalCheckLogs.add(fp);
+                $.ajax({
+                    url: appendToken('/api/proxy_check_logs'),
+                    method: 'POST',
+                    contentType: 'application/json',
+                    data: JSON.stringify({ message: message, level: level || 'info' })
+                }).done(function(data) {
+                    if (data && data.id != null) {
+                        lastProxyCheckLogId = Math.max(lastProxyCheckLogId, Number(data.id) || 0);
+                        line.dataset.logId = String(data.id);
+                    }
+                }).always(function() {
+                    pendingLocalCheckLogs.delete(fp);
+                });
+            }
         }
 
-        function clearProxyCheckLog() {
+        function clearProxyCheckLog(options = {}) {
+            const { sync = true } = options;
             const box = document.getElementById('proxy-check-log');
             if (!box) return;
             box.innerHTML = `<div class="proxy-check-log-placeholder">${tProxy('proxy_check_log_empty', '暂无检测记录')}</div>`;
             box.dataset.empty = '1';
+            pendingLocalCheckLogs.clear();
+            if (sync) {
+                $.ajax({
+                    url: appendToken('/api/proxy_check_logs'),
+                    method: 'DELETE'
+                }).done(function(data) {
+                    if (data && data.log_clear_id != null) {
+                        lastProxyCheckLogClearId = Number(data.log_clear_id) || lastProxyCheckLogClearId;
+                    }
+                });
+            }
+        }
+
+        function applyServerCheckLogs(logs, logClearId, latestLogId) {
+            if (logClearId != null && Number(logClearId) > lastProxyCheckLogClearId) {
+                lastProxyCheckLogClearId = Number(logClearId);
+                // 远端清空：仅本地清空显示，不再回写服务端
+                clearProxyCheckLog({ sync: false });
+            }
+            if (!Array.isArray(logs) || !logs.length) {
+                if (latestLogId != null) {
+                    lastProxyCheckLogId = Math.max(lastProxyCheckLogId, Number(latestLogId) || 0);
+                }
+                return;
+            }
+            logs.forEach(entry => {
+                if (!entry || entry.id == null) return;
+                const id = Number(entry.id) || 0;
+                if (id <= lastProxyCheckLogId) return;
+                const fp = proxyCheckLogFingerprint(entry.message || '', entry.level || 'info');
+                // 本页刚写过的同一条：只推进游标，避免重复显示
+                if (pendingLocalCheckLogs.has(fp)) {
+                    lastProxyCheckLogId = Math.max(lastProxyCheckLogId, id);
+                    pendingLocalCheckLogs.delete(fp);
+                    return;
+                }
+                appendProxyCheckLog(entry.message || '', entry.level || 'info', {
+                    sync: false,
+                    time: entry.time || null,
+                    id: id
+                });
+            });
+            if (latestLogId != null) {
+                lastProxyCheckLogId = Math.max(lastProxyCheckLogId, Number(latestLogId) || 0);
+            }
+        }
+
+        function syncProxyCheckState(options = {}) {
+            const { full = false } = options;
+            const since = full ? 0 : lastProxyCheckLogId;
+            return $.get(appendToken(`/api/proxy_check_state?since_log_id=${since}`), function(data) {
+                if (!data || data.status !== 'success') return;
+                if (data.revision != null) {
+                    lastProxyCheckRevision = Number(data.revision) || lastProxyCheckRevision;
+                }
+                applyServerCheckResults(data.results || {});
+                applyServerCheckLogs(data.logs || [], data.log_clear_id, data.latest_log_id);
+            });
         }
 
         function requestCheckProxy(addr, testUrl) {
@@ -3591,10 +3721,13 @@
         loadConfig();
         loadProxies();
         loadIpLists();
-        
-        setInterval(updateStatus, 2000); 
-        setInterval(updateCountdown, 1000); 
+        // 首次全量拉取共享检测状态，之后增量轮询
+        syncProxyCheckState({ full: true });
+
+        setInterval(updateStatus, 2000);
+        setInterval(updateCountdown, 1000);
         setInterval(updateLogs, 2000);
+        setInterval(function() { syncProxyCheckState(); }, 2000);
         updateStatus();
         updateCountdown();
         updateLogs();

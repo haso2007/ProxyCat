@@ -300,6 +300,13 @@ class AsyncProxyServer:
 
             results = await asyncio.gather(*(probe(proxy) for proxy in enabled_proxies))
             failed = [proxy for proxy, result in results if not result.get('valid')]
+            try:
+                from modules.modules import record_ui_check_result, append_ui_check_log
+                for proxy, result in results:
+                    record_ui_check_result(proxy, result, source='auto')
+            except Exception as e:
+                logging.debug(f'record auto-check UI results failed: {e}')
+
             disabled = 0
             if self.auto_disable_failed_proxies and failed:
                 disabled = self.disable_proxy_addresses(failed)
@@ -311,10 +318,16 @@ class AsyncProxyServer:
                 'failed': len(failed),
                 'disabled': disabled,
             }
-            logging.info(
-                '自动代理检测完成: 检测 %s，成功 %s，失败 %s，禁用 %s',
-                len(results), len(results) - len(failed), len(failed), disabled
+            summary_msg = (
+                f'自动代理检测完成: 检测 {len(results)}，'
+                f'成功 {len(results) - len(failed)}，失败 {len(failed)}，禁用 {disabled}'
             )
+            logging.info(summary_msg)
+            try:
+                from modules.modules import append_ui_check_log
+                append_ui_check_log(summary_msg, level='info', source='auto')
+            except Exception:
+                pass
 
     async def _auto_check_loop(self):
         while self.running and self.auto_check_enabled and not self.use_getip:

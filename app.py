@@ -12,7 +12,22 @@ from functools import wraps
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ProxyCat import run_server
-from modules.modules import load_config, check_proxies, check_proxy, check_proxy_detailed, get_message, load_ip_list, normalize_proxy_address, validate_proxy_format, normalized_check_timeout_ms
+from modules.modules import (
+    load_config,
+    check_proxies,
+    check_proxy,
+    check_proxy_detailed,
+    get_message,
+    load_ip_list,
+    normalize_proxy_address,
+    validate_proxy_format,
+    normalized_check_timeout_ms,
+    record_ui_check_result,
+    get_ui_check_results,
+    append_ui_check_log,
+    clear_ui_check_logs,
+    get_ui_check_state,
+)
 from modules.proxyserver import AsyncProxyServer
 import asyncio
 import threading
@@ -257,6 +272,7 @@ def handle_proxies():
                 'status': 'success',
                 'message': get_message('proxy_save_success', server.language),
                 'proxies': proxies,
+                'check_results': get_ui_check_results(),
             })
         except Exception as e:
             return jsonify({
@@ -278,9 +294,12 @@ def handle_proxies():
                 body = line[1:].lstrip() if disabled else line
                 norm = normalize_proxy_address(body) or body
                 normalized_list.append(('#' + norm) if disabled else norm)
-            return jsonify({'proxies': normalized_list})
+            return jsonify({
+                'proxies': normalized_list,
+                'check_results': get_ui_check_results(),
+            })
         except Exception:
-            return jsonify({'proxies': []})
+            return jsonify({'proxies': [], 'check_results': {}})
 
 @app.route('/api/disable_proxies', methods=['POST'])
 @require_token
@@ -319,6 +338,7 @@ def check_single_proxy_api():
 
         timeout_ms = getattr(server, 'proxy_check_timeout_ms', 2000)
         detail = asyncio.run(check_proxy_detailed(proxy, test_url, force=force, timeout_ms=timeout_ms))
+        record_ui_check_result(proxy, detail, source='manual')
         return jsonify({
             'status': 'success',
             'proxy': proxy,
@@ -364,6 +384,7 @@ def check_proxies_api():
             if not proxy or proxy.startswith('#'):
                 continue
             detail = asyncio.run(check_proxy_detailed(proxy, test_url, force=force, timeout_ms=timeout_ms))
+            record_ui_check_result(proxy, detail, source='manual')
             item = {
                 'proxy': proxy,
                 'valid': bool(detail.get('valid')),
@@ -391,6 +412,41 @@ def check_proxies_api():
             'status': 'error',
             'message': get_message('proxy_check_failed', server.language, str(e))
         })
+
+
+@app.route('/api/proxy_check_state', methods=['GET'])
+@require_token
+def proxy_check_state_api():
+    """多浏览器同步：返回最近检测结果与增量检测日志。"""
+    try:
+        since_log_id = request.args.get('since_log_id', 0)
+        state = get_ui_check_state(since_log_id)
+        return jsonify({'status': 'success', **state})
+    except Exception as e:
+        logging.exception('proxy_check_state api failed')
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/proxy_check_logs', methods=['POST', 'DELETE'])
+@require_token
+def proxy_check_logs_api():
+    """写入或清空共享检测日志。"""
+    try:
+        if request.method == 'DELETE':
+            clear_id = clear_ui_check_logs()
+            return jsonify({'status': 'success', 'log_clear_id': clear_id})
+
+        data = request.get_json(silent=True) or {}
+        message = data.get('message') or request.args.get('message') or ''
+        level = data.get('level') or request.args.get('level') or 'info'
+        entry = append_ui_check_log(message, level=level, source='client')
+        if not entry:
+            return jsonify({'status': 'error', 'message': 'empty log message'}), 400
+        return jsonify({'status': 'success', **entry})
+    except Exception as e:
+        logging.exception('proxy_check_logs api failed')
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 
 @app.route('/api/ip_lists', methods=['GET', 'POST'])
 def handle_ip_lists():

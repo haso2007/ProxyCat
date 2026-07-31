@@ -1,4 +1,5 @@
-import asyncio, logging, random, httpx, re, os, time
+import asyncio, logging, random, httpx, re, os, time, threading
+from collections import deque
 from configparser import ConfigParser
 from packaging import version
 from colorama import Fore, Style
@@ -519,6 +520,14 @@ def load_ip_list(file_path):
 _proxy_check_cache = {}
 _proxy_check_ttl = 10
 
+# Web UI 共享的检测结果 / 日志（多浏览器同步）
+_ui_check_lock = threading.RLock()
+_ui_check_results = {}  # normalized proxy -> last result
+_ui_check_logs = deque(maxlen=500)
+_ui_check_log_id = 0
+_ui_check_log_clear_id = 0
+_ui_check_revision = 0
+
 # 检测超时安全边界
 CHECK_TIMEOUT_MS_MIN = 200
 CHECK_TIMEOUT_MS_MAX = 60000
@@ -535,6 +544,129 @@ def normalized_check_timeout_ms(value):
     if ms > CHECK_TIMEOUT_MS_MAX:
         return CHECK_TIMEOUT_MS_MAX
     return ms
+
+
+def _normalize_ui_check_proxy_key(proxy):
+    """规范化代理地址，用作 UI 检测结果字典键。"""
+    key = normalize_proxy_address(proxy or '')
+    if key.startswith('#'):
+        key = key[1:]
+    return key
+
+
+def record_ui_check_result(proxy, detail, source='api'):
+    """保存最近一次检测结果，供所有 Web 客户端同步延迟/状态。"""
+    global _ui_check_revision
+    key = _normalize_ui_check_proxy_key(proxy)
+    if not key:
+        return None
+
+    if isinstance(detail, dict):
+        valid = bool(detail.get('valid'))
+        elapsed_ms = detail.get('elapsed_ms', 0)
+        error = detail.get('error')
+        error_code = detail.get('error_code')
+        timed_out = bool(detail.get('timed_out'))
+        test_url = detail.get('test_url')
+    else:
+        valid = bool(detail)
+        elapsed_ms = 0
+        error = None if valid else 'probe failed'
+        error_code = None if valid else 'probe_failed'
+        timed_out = False
+        test_url = None
+
+    try:
+        elapsed_ms = int(elapsed_ms or 0)
+    except (TypeError, ValueError):
+        elapsed_ms = 0
+
+    entry = {
+        'proxy': key,
+        'valid': valid,
+        'status': 'ok' if valid else 'fail',
+        'elapsed_ms': elapsed_ms,
+        'error': error,
+        'error_code': error_code,
+        'timed_out': timed_out,
+        'test_url': test_url,
+        'checked_at': time.time(),
+        'source': source or 'api',
+    }
+    with _ui_check_lock:
+        _ui_check_results[key] = entry
+        _ui_check_revision += 1
+        return dict(entry)
+
+
+def get_ui_check_results():
+    with _ui_check_lock:
+        return {k: dict(v) for k, v in _ui_check_results.items()}
+
+
+def append_ui_check_log(message, level='info', source='client'):
+    """追加一条检测日志；返回带 id 的条目，便于多浏览器增量同步。"""
+    global _ui_check_log_id, _ui_check_revision
+    text = str(message or '').strip()
+    if not text:
+        return None
+    level = level if level in ('info', 'ok', 'fail') else 'info'
+    now = time.time()
+    with _ui_check_lock:
+        _ui_check_log_id += 1
+        _ui_check_revision += 1
+        entry = {
+            'id': _ui_check_log_id,
+            'ts': now,
+            'time': time.strftime('%H:%M:%S', time.localtime(now)),
+            'message': text,
+            'level': level,
+            'source': source or 'client',
+        }
+        _ui_check_logs.append(entry)
+        return dict(entry)
+
+
+def get_ui_check_logs(since_id=0):
+    try:
+        since_id = int(since_id or 0)
+    except (TypeError, ValueError):
+        since_id = 0
+    with _ui_check_lock:
+        if since_id <= 0:
+            return [dict(e) for e in _ui_check_logs]
+        return [dict(e) for e in _ui_check_logs if e['id'] > since_id]
+
+
+def clear_ui_check_logs():
+    """清空检测日志（所有浏览器可见）。"""
+    global _ui_check_log_clear_id, _ui_check_revision
+    with _ui_check_lock:
+        _ui_check_logs.clear()
+        _ui_check_log_clear_id += 1
+        _ui_check_revision += 1
+        return _ui_check_log_clear_id
+
+
+def get_ui_check_state(since_log_id=0):
+    """返回检测结果 + 增量日志，供 Web 轮询。"""
+    try:
+        since_log_id = int(since_log_id or 0)
+    except (TypeError, ValueError):
+        since_log_id = 0
+    with _ui_check_lock:
+        if since_log_id <= 0:
+            logs = [dict(e) for e in _ui_check_logs]
+        else:
+            logs = [dict(e) for e in _ui_check_logs if e['id'] > since_log_id]
+        return {
+            'revision': _ui_check_revision,
+            'log_clear_id': _ui_check_log_clear_id,
+            'latest_log_id': _ui_check_log_id,
+            'results': {k: dict(v) for k, v in _ui_check_results.items()},
+            'logs': logs,
+        }
+
 
 # 常见代理协议别名 → 内部标准协议
 PROXY_SCHEME_ALIASES = {

@@ -1076,13 +1076,19 @@
 
 .proxy-test {
     flex: 0 0 auto;
-    width: 30px;
+    min-width: 30px;
     height: 30px;
+    padding: 0 7px;
     border: none;
     border-radius: 6px;
     background: transparent;
     color: #8a93a0;
     cursor: pointer;
+    font-family: monospace;
+    font-size: 0.78rem;
+    font-weight: 700;
+    line-height: 30px;
+    text-align: center;
     transition: all 0.2s ease;
 }
 
@@ -1097,9 +1103,29 @@
     cursor: wait;
 }
 
+/* 成功时显示延迟；由低到高使用绿/橙/红的颜色分级。 */
 .proxy-test.is-ok {
+    background: rgba(31, 157, 85, 0.12);
+}
+
+.proxy-test.is-latency-fast {
     color: #1f9d55;
     background: rgba(31, 157, 85, 0.12);
+}
+
+.proxy-test.is-latency-medium {
+    color: #d9822b;
+    background: rgba(217, 130, 43, 0.13);
+}
+
+.proxy-test.is-latency-slow {
+    color: #dc3545;
+    background: rgba(220, 53, 69, 0.12);
+}
+
+.proxy-test.is-latency-unknown {
+    color: #6c757d;
+    background: rgba(108, 117, 125, 0.12);
 }
 
 .proxy-test.is-ok:hover {
@@ -1297,8 +1323,22 @@
     }
 
     .proxy-test.is-ok {
+        background: rgba(31, 157, 85, 0.18);
+    }
+
+    .proxy-test.is-latency-fast {
         color: #3dd68c;
         background: rgba(31, 157, 85, 0.18);
+    }
+
+    .proxy-test.is-latency-medium {
+        color: #f0c36a;
+        background: rgba(230, 162, 60, 0.18);
+    }
+
+    .proxy-test.is-latency-slow {
+        color: #ff6b7a;
+        background: rgba(220, 53, 69, 0.18);
     }
 
     .proxy-test.is-fail {

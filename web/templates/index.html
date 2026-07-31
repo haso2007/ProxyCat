@@ -1871,7 +1871,12 @@
                 // 保留已有检测状态（按地址）
                 const prevStatus = {};
                 proxyItems.forEach(item => {
-                    if (item.addr && item.checkStatus) prevStatus[item.addr] = item.checkStatus;
+                    if (item.addr && item.checkStatus) {
+                        prevStatus[item.addr] = {
+                            status: item.checkStatus,
+                            latency: item.checkLatency
+                        };
+                    }
                 });
                 proxyItems = (data.proxies || [])
                     .map(line => (line || '').trim())
@@ -1882,7 +1887,8 @@
                             enabled: !line.startsWith('#'),
                             selected: false,
                             addr,
-                            checkStatus: prevStatus[addr] || null // null | testing | ok | fail
+                            checkStatus: prevStatus[addr] ? prevStatus[addr].status : null, // null | testing | ok | fail
+                            checkLatency: prevStatus[addr] ? prevStatus[addr].latency : null
                         };
                     })
                     .filter(item => item.addr);
@@ -1940,7 +1946,9 @@
                     testBtn.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
                     testBtn.disabled = true;
                 } else if (item.checkStatus === 'ok') {
-                    testBtn.innerHTML = '<i class="fa fa-check"></i>';
+                    testBtn.classList.add(latencyClass(item.checkLatency));
+                    testBtn.textContent = formatLatency(item.checkLatency);
+                    testBtn.title = `${tProxy('proxy_test_btn', '测试连通性')} · ${formatLatency(item.checkLatency)}`;
                 } else if (item.checkStatus === 'fail') {
                     testBtn.innerHTML = '<i class="fa fa-times"></i>';
                 } else {
@@ -1967,6 +1975,26 @@
             updateProxyCount();
         }
 
+        function formatLatency(latency) {
+            const value = Number(latency);
+            return Number.isFinite(value) && value >= 0 ? `${Math.round(value)}ms` : '--';
+        }
+
+        function latencyClass(latency) {
+            const value = Number(latency);
+            if (!Number.isFinite(value) || value < 0) return 'is-latency-unknown';
+            if (value < 500) return 'is-latency-fast';
+            if (value < 1500) return 'is-latency-medium';
+            return 'is-latency-slow';
+        }
+
+        function applyProxyCheckResult(item, data) {
+            const ok = !!(data && data.status === 'success' && data.valid);
+            item.checkStatus = ok ? 'ok' : 'fail';
+            item.checkLatency = ok && data.elapsed_ms != null ? Number(data.elapsed_ms) : null;
+            return ok;
+        }
+
         function updateProxyTestButton(idx) {
             const item = proxyItems[idx];
             if (!item) return;
@@ -1981,7 +2009,9 @@
             if (item.checkStatus === 'testing') {
                 btn.innerHTML = '<i class="fa fa-spinner fa-spin"></i>';
             } else if (item.checkStatus === 'ok') {
-                btn.innerHTML = '<i class="fa fa-check"></i>';
+                btn.classList.add(latencyClass(item.checkLatency));
+                btn.textContent = formatLatency(item.checkLatency);
+                btn.title = `${tProxy('proxy_test_btn', '测试连通性')} · ${formatLatency(item.checkLatency)}`;
             } else if (item.checkStatus === 'fail') {
                 btn.innerHTML = '<i class="fa fa-times"></i>';
             } else {
@@ -2057,6 +2087,7 @@
 
             const testUrl = getProxyTestUrl();
             item.checkStatus = 'testing';
+            item.checkLatency = null;
             updateProxyTestButton(idx);
             appendProxyCheckLog(
                 tProxy('proxy_check_item_testing', '检测中：{}').replace('{}', item.addr),
@@ -2065,13 +2096,13 @@
 
             requestCheckProxy(item.addr, testUrl)
                 .done(function(data) {
-                    const ok = !!(data && data.status === 'success' && data.valid);
-                    item.checkStatus = ok ? 'ok' : 'fail';
+                    const ok = applyProxyCheckResult(item, data);
                     updateProxyTestButton(idx);
                     appendProxyCheckLog(formatCheckResultLog(item.addr, data, ok), ok ? 'ok' : 'fail');
                 })
                 .fail(function(xhr) {
                     item.checkStatus = 'fail';
+                    item.checkLatency = null;
                     updateProxyTestButton(idx);
                     let err = '';
                     try {
@@ -2272,6 +2303,7 @@
                 const item = proxyItems[idx];
 
                 item.checkStatus = 'testing';
+                item.checkLatency = null;
                 updateProxyTestButton(idx);
                 appendProxyCheckLog(
                     tProxy('proxy_check_item_testing', '检测中：{}').replace('{}', item.addr)
@@ -2284,8 +2316,7 @@
                     const data = await requestCheckProxy(item.addr, testUrl);
                     if (proxyCheckCtl.stopRequested) {
                         // 停止时若请求已返回，仍记录结果
-                        const ok = !!(data && data.status === 'success' && data.valid);
-                        item.checkStatus = ok ? 'ok' : 'fail';
+                        const ok = applyProxyCheckResult(item, data);
                         if (ok) proxyCheckCtl.okCount++; else proxyCheckCtl.failCount++;
                         updateProxyTestButton(idx);
                         appendProxyCheckLog(formatCheckResultLog(item.addr, data, ok), ok ? 'ok' : 'fail');
@@ -2293,8 +2324,7 @@
                         stopped = true;
                         break;
                     }
-                    const ok = !!(data && data.status === 'success' && data.valid);
-                    item.checkStatus = ok ? 'ok' : 'fail';
+                    const ok = applyProxyCheckResult(item, data);
                     if (ok) proxyCheckCtl.okCount++; else proxyCheckCtl.failCount++;
                     updateProxyTestButton(idx);
                     appendProxyCheckLog(formatCheckResultLog(item.addr, data, ok), ok ? 'ok' : 'fail');
@@ -2304,6 +2334,7 @@
                     if (aborted) {
                         // 当前条被中止：恢复为未检测，不计入失败
                         item.checkStatus = null;
+                        item.checkLatency = null;
                         updateProxyTestButton(idx);
                         appendProxyCheckLog(
                             tProxy('check_item_aborted', '已中止：{}').replace('{}', item.addr),
@@ -2313,6 +2344,7 @@
                         break;
                     }
                     item.checkStatus = 'fail';
+                    item.checkLatency = null;
                     proxyCheckCtl.failCount++;
                     updateProxyTestButton(idx);
                     appendProxyCheckLog(

@@ -49,6 +49,32 @@ Therefore, **ProxyCat** was born! This tool aims to transform short-term IPs (la
 
 [ProxyCat Operation Manual](../main/ProxyCat-Manual/Operation%20Manual.md)
 
+## Updating Code (Important for Docker Users)
+
+When deploying with Docker, the `config/` directory and `docker-compose.yml` contain your personal settings.
+
+Before running `git pull`, back them up. After pulling, restore them to avoid being overwritten:
+
+```bash
+# 1. Backup
+rm -rf backup.bak && mkdir backup.bak
+cp -r config docker-compose.yml backup.bak/
+
+# 2. Pull latest code
+git pull
+
+# 3. Restore your config
+cp -r backup.bak/config ./
+cp backup.bak/docker-compose.yml ./
+```
+
+After restoring, rebuild and restart:
+
+```bash
+docker-compose down
+docker-compose up -d --build
+```
+
 ## Error Troubleshooting
 
 [ProxyCat Investigation Manual](../main/ProxyCat-Manual/Investigation%20Manual.md)

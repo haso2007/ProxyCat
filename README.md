@@ -49,6 +49,31 @@
 
 [ProxyCat操作手册](../main/ProxyCat-Manual/Operation%20Manual.md)
 
+## 更新代码（Docker 用户必看）
+
+使用 Docker 部署时，`config/` 目录和 `docker-compose.yml` 是你的个人配置。
+
+更新代码前请先备份，`git pull` 后再恢复，避免被覆盖：
+
+```bash
+# 1. 备份
+rm -rf backup.bak && mkdir backup.bak
+cp -r config docker-compose.yml backup.bak/
+
+# 2. 拉取最新代码
+git pull
+
+# 3. 恢复配置
+cp -r backup.bak/config ./
+cp backup.bak/docker-compose.yml ./
+```
+
+恢复后重新构建运行：
+```bash
+docker-compose down
+docker-compose up -d --build
+```
+
 ## 报错排查
 
 [ProxyCat排查手册](../main/ProxyCat-Manual/Investigation%20Manual.md)

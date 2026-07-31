@@ -12,7 +12,7 @@ from functools import wraps
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ProxyCat import run_server
-from modules.modules import load_config, check_proxies, get_message, load_ip_list
+from modules.modules import load_config, check_proxies, check_proxy, check_proxy_detailed, get_message, load_ip_list, normalize_proxy_address, validate_proxy_format
 from modules.proxyserver import AsyncProxyServer
 import asyncio
 import threading
@@ -197,7 +197,22 @@ def save_config():
 def handle_proxies():
     if request.method == 'POST':
         try:
-            proxies = request.json.get('proxies', [])
+            raw_proxies = request.json.get('proxies', [])
+            proxies = []
+            for line in raw_proxies:
+                line = (line or '').strip()
+                if not line:
+                    continue
+                # 保留禁用标记，但对内容做协议别名规范化
+                disabled = line.startswith('#')
+                body = line[1:].lstrip() if disabled else line
+                normalized = normalize_proxy_address(body)
+                if not normalized or not validate_proxy_format(normalized):
+                    # 无效行跳过，避免写坏配置
+                    logging.warning(f'skip invalid proxy on save: {line}')
+                    continue
+                proxies.append(('#' + normalized) if disabled else normalized)
+
             proxy_file = get_config_path(os.path.basename(server.proxy_file))
             with open(proxy_file, 'w', encoding='utf-8') as f:
                 f.write('\n'.join(proxies))
@@ -207,7 +222,8 @@ def handle_proxies():
                 server.current_proxy = next(server.proxy_cycle)
             return jsonify({
                 'status': 'success',
-                'message': get_message('proxy_save_success', server.language)
+                'message': get_message('proxy_save_success', server.language),
+                'proxies': proxies,
             })
         except Exception as e:
             return jsonify({
@@ -219,23 +235,98 @@ def handle_proxies():
             proxy_file = get_config_path(os.path.basename(server.proxy_file))
             with open(proxy_file, 'r', encoding='utf-8') as f:
                 proxies = f.read().splitlines()
-            return jsonify({'proxies': proxies})
+            # 读出时也做一次展示向规范化（禁用行保留 #）
+            normalized_list = []
+            for line in proxies:
+                line = (line or '').strip()
+                if not line:
+                    continue
+                disabled = line.startswith('#')
+                body = line[1:].lstrip() if disabled else line
+                norm = normalize_proxy_address(body) or body
+                normalized_list.append(('#' + norm) if disabled else norm)
+            return jsonify({'proxies': normalized_list})
         except Exception:
             return jsonify({'proxies': []})
 
-@app.route('/api/check_proxies')
+@app.route('/api/check_proxy', methods=['POST'])
+def check_single_proxy_api():
+    """检测单个代理连通性，供前端逐条测试使用。"""
+    try:
+        data = request.get_json(silent=True) or {}
+        proxy = (data.get('proxy') or request.args.get('proxy') or '').strip()
+        test_url = (data.get('test_url') or request.args.get('test_url') or 'https://www.baidu.com').strip()
+        force = bool(data.get('force', True))
+
+        if not proxy:
+            return jsonify({
+                'status': 'error',
+                'valid': False,
+                'message': get_message('proxy_check_failed', server.language, 'empty proxy')
+            }), 400
+
+        detail = asyncio.run(check_proxy_detailed(proxy, test_url, force=force))
+        return jsonify({
+            'status': 'success',
+            'proxy': proxy,
+            'valid': bool(detail.get('valid')),
+            'error': detail.get('error'),
+            'elapsed_ms': detail.get('elapsed_ms', 0),
+            'test_url': test_url,
+            'cached': bool(detail.get('cached')),
+        })
+    except Exception as e:
+        logging.exception('check_proxy api failed')
+        return jsonify({
+            'status': 'error',
+            'valid': False,
+            'error': str(e),
+            'message': get_message('proxy_check_failed', server.language, str(e))
+        })
+
+@app.route('/api/check_proxies', methods=['GET', 'POST'])
 def check_proxies_api():
     try:
-        test_url = request.args.get('test_url', 'https://www.baidu.com')
-        valid_proxies = asyncio.run(check_proxies(server.proxies, test_url))
+        if request.method == 'POST':
+            data = request.get_json(silent=True) or {}
+            test_url = (data.get('test_url') or 'https://www.baidu.com').strip()
+            proxies = data.get('proxies')
+            if proxies is None:
+                proxies = list(server.proxies or [])
+            force = bool(data.get('force', True))
+        else:
+            test_url = request.args.get('test_url', 'https://www.baidu.com')
+            proxies = list(server.proxies or [])
+            force = True
+
+        results = []
+        valid_proxies = []
+        for proxy in proxies:
+            proxy = (proxy or '').strip()
+            if not proxy or proxy.startswith('#'):
+                continue
+            detail = asyncio.run(check_proxy_detailed(proxy, test_url, force=force))
+            item = {
+                'proxy': proxy,
+                'valid': bool(detail.get('valid')),
+                'error': detail.get('error'),
+                'elapsed_ms': detail.get('elapsed_ms', 0),
+            }
+            results.append(item)
+            if item['valid']:
+                valid_proxies.append(proxy)
+
         total_valid = len(valid_proxies)
         return jsonify({
             'status': 'success',
             'valid_proxies': valid_proxies,
+            'results': results,
             'total': total_valid,
+            'checked': len(results),
             'message': get_message('proxy_check_result', server.language, total_valid)
         })
     except Exception as e:
+        logging.exception('check_proxies api failed')
         return jsonify({
             'status': 'error',
             'message': get_message('proxy_check_failed', server.language, str(e))

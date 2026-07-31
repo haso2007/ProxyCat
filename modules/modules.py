@@ -515,124 +515,298 @@ def load_ip_list(file_path):
 _proxy_check_cache = {}
 _proxy_check_ttl = 10
 
+# 常见代理协议别名 → 内部标准协议
+PROXY_SCHEME_ALIASES = {
+    'socks5h': 'socks5',  # curl: DNS 也走代理
+    'socks5a': 'socks5',
+    'socks': 'socks5',
+    'socks4a': 'socks5',  # 引擎仅实现 socks5，降级归并避免直接拒收
+    'socks4': 'socks5',
+    'http': 'http',
+    'https': 'https',
+    'socks5': 'socks5',
+}
+
+def normalize_proxy_address(proxy):
+    """规范化代理地址：去空白、补协议、别名归并（socks5h→socks5 等）。"""
+    if proxy is None:
+        return ''
+    s = str(proxy).strip()
+    if not s:
+        return ''
+    # 禁用项以 # 开头时，规范化时先去掉再由调用方决定是否加回
+    disabled = False
+    if s.startswith('#'):
+        disabled = True
+        s = re.sub(r'^#+\s*', '', s).strip()
+        if not s:
+            return ''
+
+    if '://' not in s:
+        s = 'http://' + s
+
+    scheme, rest = s.split('://', 1)
+    scheme = scheme.strip().lower()
+    scheme = PROXY_SCHEME_ALIASES.get(scheme, scheme)
+    rest = rest.strip()
+    normalized = f'{scheme}://{rest}'
+    return f'#{normalized}' if disabled else normalized
+
 def parse_proxy(proxy):
     try:
-        protocol = proxy.split('://')[0]
-        remaining = proxy.split('://')[1]
-        
+        proxy = normalize_proxy_address(proxy)
+        if proxy.startswith('#'):
+            proxy = proxy[1:]
+        if '://' not in proxy:
+            return None, None, None, None
+
+        protocol, remaining = proxy.split('://', 1)
+        protocol = PROXY_SCHEME_ALIASES.get(protocol.lower(), protocol.lower())
+
         if '@' in remaining:
-            auth, address = remaining.split('@')
-            host, port = address.split(':')
-            return protocol, auth, host, int(port)
+            # 只按最后一个 @ 分割，兼容密码中含 : 的情况
+            auth, address = remaining.rsplit('@', 1)
         else:
-            host, port = remaining.split(':')
-            return protocol, None, host, int(port)
+            auth, address = None, remaining
+
+        # host:port —— 从右侧拆端口，兼容将来可能的异常主机写法
+        host, port_s = address.rsplit(':', 1)
+        host = host.strip()
+        # 去掉 IPv6 中括号（若有）
+        if host.startswith('[') and host.endswith(']'):
+            host = host[1:-1]
+        port = int(port_s)
+        if not host or not (0 < port < 65536):
+            return None, None, None, None
+        return protocol, auth, host, port
     except Exception:
         return None, None, None, None
+
+def validate_proxy_format(proxy):
+    """格式是否可被引擎接受（会先做别名规范化）。"""
+    protocol, auth, host, port = parse_proxy(proxy)
+    if protocol not in ('http', 'https', 'socks5'):
+        return False
+    if not host or port is None:
+        return False
+    return 0 < int(port) < 65536
+
+def _proxy_url_from_parts(protocol, auth, host, port):
+    protocol = PROXY_SCHEME_ALIASES.get((protocol or '').lower(), (protocol or '').lower())
+    if auth:
+        return f'{protocol}://{auth}@{host}:{port}'
+    return f'{protocol}://{host}:{port}'
+
+def _httpx_proxy_kwargs(proxy_url):
+    """兼容 httpx 0.27(proxies=) 与 0.28+(proxy=)。"""
+    try:
+        ver = tuple(int(x) for x in httpx.__version__.split('.')[:2])
+    except Exception:
+        ver = (0, 28)
+    if ver >= (0, 28):
+        return {'proxy': proxy_url}
+    return {'proxies': {'http://': proxy_url, 'https://': proxy_url, 'all://': proxy_url}}
 
 async def check_http_proxy(proxy, test_url=None):
     if test_url is None:
         test_url = 'https://www.baidu.com'
     protocol, auth, host, port = parse_proxy(proxy)
-    proxies = {}
-    if auth:
-        proxies['http://'] = f'{protocol}://{auth}@{host}:{port}'
-        proxies['https://'] = f'{protocol}://{auth}@{host}:{port}'
-    else:
-        proxies['http://'] = f'{protocol}://{host}:{port}'
-        proxies['https://'] = f'{protocol}://{host}:{port}'
-        
-    try:
-        async with httpx.AsyncClient(proxies=proxies, timeout=10, verify=False) as client:
-            try:
-                response = await client.get(test_url)
+    if not all([protocol, host, port]):
+        raise ValueError(f'invalid proxy format: {proxy}')
+
+    proxy_url = _proxy_url_from_parts(protocol, auth, host, port)
+    client_kwargs = {
+        'timeout': 10.0,
+        'verify': False,
+        'follow_redirects': True,
+    }
+    client_kwargs.update(_httpx_proxy_kwargs(proxy_url))
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        try:
+            response = await client.get(test_url)
+            if response.status_code == 200:
+                return True
+            # 非 200 也尝试 http 回落
+            if test_url.startswith('https://'):
+                http_url = 'http://' + test_url[8:]
+                response = await client.get(http_url)
                 return response.status_code == 200
-            except:
-                if test_url.startswith('https://'):
+            raise RuntimeError(f'HTTP {response.status_code} from {test_url}')
+        except Exception as first_err:
+            if test_url.startswith('https://'):
+                try:
                     http_url = 'http://' + test_url[8:]
                     response = await client.get(http_url)
-                    return response.status_code == 200
-                return False
-    except:
-        return False
+                    if response.status_code == 200:
+                        return True
+                    raise RuntimeError(f'HTTP {response.status_code} from {http_url}') from first_err
+                except Exception:
+                    raise first_err
+            raise
 
 async def check_socks_proxy(proxy, test_url=None):
     if test_url is None:
         test_url = 'https://www.baidu.com'
     protocol, auth, host, port = parse_proxy(proxy)
     if not all([host, port]):
-        return False
-        
+        raise ValueError(f'invalid socks proxy format: {proxy}')
+
+    # 优先用 httpx 走 socks（若已安装 socks 扩展），失败再回落手工握手
+    proxy_url = _proxy_url_from_parts(protocol or 'socks5', auth, host, port)
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=5)
-        
+        client_kwargs = {
+            'timeout': 10.0,
+            'verify': False,
+            'follow_redirects': True,
+        }
+        client_kwargs.update(_httpx_proxy_kwargs(proxy_url))
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            response = await client.get(test_url)
+            if response.status_code == 200:
+                return True
+            if test_url.startswith('https://'):
+                http_url = 'http://' + test_url[8:]
+                response = await client.get(http_url)
+                if response.status_code == 200:
+                    return True
+            raise RuntimeError(f'HTTP {response.status_code} via socks proxy')
+    except ImportError:
+        pass
+    except Exception:
+        # 回落到原始 SOCKS5 握手探测
+        pass
+
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=5)
+
+    try:
         if auth:
             writer.write(b'\x05\x02\x00\x02')
         else:
             writer.write(b'\x05\x01\x00')
-            
+
         await writer.drain()
-        
+
         auth_method = await asyncio.wait_for(reader.readexactly(2), timeout=5)
         if auth_method[0] != 0x05:
-            return False
-            
+            raise RuntimeError('invalid SOCKS5 version in response')
+
         if auth_method[1] == 0x02 and auth:
             username, password = auth.split(':')
             auth_packet = bytes([0x01, len(username)]) + username.encode() + bytes([len(password)]) + password.encode()
             writer.write(auth_packet)
             await writer.drain()
-            
+
             auth_response = await asyncio.wait_for(reader.readexactly(2), timeout=5)
             if auth_response[1] != 0x00:
-                return False
-        
+                raise RuntimeError('SOCKS5 authentication failed')
+        elif auth_method[1] == 0xFF:
+            raise RuntimeError('SOCKS5 no acceptable auth method')
+
         from urllib.parse import urlparse
         domain = urlparse(test_url).netloc if '://' in test_url else test_url
-        domain = domain.encode()
-        
+        domain = domain.split(':')[0].encode()
+
         writer.write(b'\x05\x01\x00\x03' + bytes([len(domain)]) + domain + b'\x00\x50')
         await writer.drain()
-        
-        response = await asyncio.wait_for(reader.readexactly(10), timeout=5)
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except:
-            pass
-        
-        return response[1] == 0x00
-        
-    except Exception:
-        return False
 
-async def check_proxy(proxy, test_url=None):
+        response = await asyncio.wait_for(reader.readexactly(10), timeout=5)
+        if response[1] != 0x00:
+            raise RuntimeError(f'SOCKS5 connect failed, code={response[1]}')
+        return True
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+async def check_proxy(proxy, test_url=None, force=False):
+    result = await check_proxy_detailed(proxy, test_url=test_url, force=force)
+    return bool(result.get('valid'))
+
+async def check_proxy_detailed(proxy, test_url=None, force=False):
+    """返回 {valid, error, elapsed_ms, proxy, test_url}，供 API/UI 展示真实原因。"""
     current_time = time.time()
+    test_url = test_url or 'https://www.baidu.com'
+    original_proxy = proxy
+    proxy = normalize_proxy_address(proxy)
+    if proxy.startswith('#'):
+        proxy = proxy[1:]
     cache_key = f"{proxy}:{test_url}"
-    
-    if cache_key in _proxy_check_cache:
-        cache_time, is_valid = _proxy_check_cache[cache_key]
+    started = time.time()
+
+    if not force and cache_key in _proxy_check_cache:
+        cache_time, cached = _proxy_check_cache[cache_key]
         if current_time - cache_time < _proxy_check_ttl:
-            return is_valid
-            
-    proxy_type = proxy.split('://')[0]
+            if isinstance(cached, dict):
+                return {
+                    'valid': bool(cached.get('valid')),
+                    'error': cached.get('error'),
+                    'elapsed_ms': cached.get('elapsed_ms', 0),
+                    'proxy': proxy,
+                    'input_proxy': original_proxy,
+                    'test_url': test_url,
+                    'cached': True,
+                }
+            return {
+                'valid': bool(cached),
+                'error': None if cached else 'cached failure',
+                'elapsed_ms': 0,
+                'proxy': proxy,
+                'input_proxy': original_proxy,
+                'test_url': test_url,
+                'cached': True,
+            }
+
+    proxy_type = proxy.split('://')[0].lower() if '://' in (proxy or '') else ''
+    proxy_type = PROXY_SCHEME_ALIASES.get(proxy_type, proxy_type)
     check_funcs = {
         'http': check_http_proxy,
         'https': check_http_proxy,
-        'socks5': check_socks_proxy
+        'socks5': check_socks_proxy,
     }
-    
+
     if proxy_type not in check_funcs:
-        return False
-    
+        result = {
+            'valid': False,
+            'error': f'unsupported scheme: {proxy_type or "(none)"}',
+            'elapsed_ms': int((time.time() - started) * 1000),
+            'proxy': proxy,
+            'input_proxy': original_proxy,
+            'test_url': test_url,
+            'cached': False,
+        }
+        _proxy_check_cache[cache_key] = (time.time(), result)
+        return result
+
     try:
-        test_url = test_url or 'https://www.baidu.com'
         is_valid = await check_funcs[proxy_type](proxy, test_url)
-        _proxy_check_cache[cache_key] = (current_time, is_valid)
-        return is_valid
-    except Exception:
-        _proxy_check_cache[cache_key] = (current_time, False)
-        return False
+        result = {
+            'valid': bool(is_valid),
+            'error': None if is_valid else 'probe returned false',
+            'elapsed_ms': int((time.time() - started) * 1000),
+            'proxy': proxy,
+            'input_proxy': original_proxy,
+            'test_url': test_url,
+            'cached': False,
+        }
+        _proxy_check_cache[cache_key] = (time.time(), result)
+        return result
+    except Exception as e:
+        err = f'{type(e).__name__}: {e}'
+        logging.warning(f'proxy check failed: {proxy} -> {err}')
+        result = {
+            'valid': False,
+            'error': err,
+            'elapsed_ms': int((time.time() - started) * 1000),
+            'proxy': proxy,
+            'input_proxy': original_proxy,
+            'test_url': test_url,
+            'cached': False,
+        }
+        _proxy_check_cache[cache_key] = (time.time(), result)
+        return result
 
 async def check_proxies(proxies, test_url=None):
     valid_proxies = []

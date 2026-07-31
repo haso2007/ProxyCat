@@ -1,5 +1,5 @@
 import asyncio, httpx, logging, re, socket, struct, time, base64, random, os
-from modules.modules import get_message, load_ip_list
+from modules.modules import get_message, load_ip_list, normalize_proxy_address, validate_proxy_format, PROXY_SCHEME_ALIASES
 from asyncio import TimeoutError
 from itertools import cycle
 from config import getip
@@ -8,17 +8,24 @@ from configparser import ConfigParser
 
 def load_proxies(file_path='ip.txt'):
     with open(file_path, 'r') as file:
-        return [line.strip() for line in file
-                if '://' in line and not line.strip().startswith('#')]
+        result = []
+        for line in file:
+            line = line.strip()
+            if not line or line.startswith('#') or '://' not in line:
+                continue
+            normalized = normalize_proxy_address(line)
+            if normalized and validate_proxy_format(normalized):
+                result.append(normalized)
+        return result
 
 def validate_proxy(proxy):
-    pattern = re.compile(r'^(?P<scheme>socks5|http|https)://(?:(?P<auth>[^@]+)@)?(?P<host>[^:]+):(?P<port>\d+)$')
-    match = pattern.match(proxy)
-    if not match:
+    """兼容 socks5h/socks5a 等别名，规范化后校验。"""
+    if not proxy:
         return False
-    
-    port = int(match.group('port'))
-    return 0 < port < 65536
+    normalized = normalize_proxy_address(proxy)
+    if normalized.startswith('#'):
+        normalized = normalized[1:]
+    return validate_proxy_format(normalized)
 
 class AsyncProxyServer:
     def __init__(self, config):
@@ -180,8 +187,16 @@ class AsyncProxyServer:
             proxy_file = os.path.join('config', os.path.basename(self.proxy_file))
             if os.path.exists(proxy_file):
                 with open(proxy_file, 'r', encoding='utf-8') as f:
-                    proxies = [line.strip() for line in f
-                               if line.strip() and not line.strip().startswith('#')]
+                    proxies = []
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith('#'):
+                            continue
+                        normalized = normalize_proxy_address(line)
+                        if normalized and validate_proxy(normalized):
+                            proxies.append(normalized)
+                        elif line:
+                            logging.warning(f'跳过无效代理行: {line}')
                 return proxies
             else:
                 logging.error(get_message('proxy_file_not_found', self.language, proxy_file))
@@ -451,35 +466,49 @@ class AsyncProxyServer:
         return None, proxy_addr
 
     async def _create_client(self, proxy):
-        proxy_type, proxy_addr = proxy.split('://')
+        proxy = normalize_proxy_address(proxy)
+        if proxy.startswith('#'):
+            proxy = proxy[1:]
+        proxy_type, proxy_addr = proxy.split('://', 1)
+        proxy_type = PROXY_SCHEME_ALIASES.get(proxy_type.lower(), proxy_type.lower())
         proxy_auth = None
-        
+
         if '@' in proxy_addr:
-            auth, proxy_addr = proxy_addr.split('@')
+            auth, proxy_addr = proxy_addr.rsplit('@', 1)
             proxy_auth = auth
-        
+
         if proxy_auth:
             proxy_url = f"{proxy_type}://{proxy_auth}@{proxy_addr}"
         else:
             proxy_url = f"{proxy_type}://{proxy_addr}"
-            
+
         import logging as httpx_logging
         httpx_logging.getLogger("httpx").setLevel(logging.WARNING)
         httpx_logging.getLogger("hpack").setLevel(logging.WARNING)
         httpx_logging.getLogger("h2").setLevel(logging.WARNING)
-            
-        return httpx.AsyncClient(
-            proxies={"all://": proxy_url},
-            limits=httpx.Limits(
+
+        # 兼容 httpx 0.27(proxies=) / 0.28+(proxy=)
+        client_kwargs = {
+            'limits': httpx.Limits(
                 max_keepalive_connections=100,
                 max_connections=1000,
                 keepalive_expiry=30
             ),
-            timeout=30.0,
-            http2=True,
-            verify=False,
-            follow_redirects=True
-        )
+            'timeout': 30.0,
+            'http2': True,
+            'verify': False,
+            'follow_redirects': True,
+        }
+        try:
+            ver = tuple(int(x) for x in httpx.__version__.split('.')[:2])
+        except Exception:
+            ver = (0, 28)
+        if ver >= (0, 28):
+            client_kwargs['proxy'] = proxy_url
+        else:
+            client_kwargs['proxies'] = {"all://": proxy_url}
+
+        return httpx.AsyncClient(**client_kwargs)
 
     async def _cleanup_connections(self):
         current_time = time.time()

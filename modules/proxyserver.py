@@ -275,14 +275,85 @@ class AsyncProxyServer:
             logging.warning(f'自动禁用 {changed} 个检测失败代理')
             return changed
 
+    def load_all_proxies(self):
+        """加载文件中的所有代理（包括已被 # 注释掉的禁用代理）"""
+        try:
+            proxy_file = os.path.join('config', os.path.basename(self.proxy_file))
+            if os.path.exists(proxy_file):
+                with open(proxy_file, 'r', encoding='utf-8') as f:
+                    proxies = []
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        normalized = normalize_proxy_address(line)
+                        if normalized and validate_proxy(normalized):
+                            proxies.append(normalized)
+                    return proxies
+            else:
+                return []
+        except Exception as e:
+            logging.error(f"加载所有代理列表失败: {e}")
+            return []
+
+    def enable_proxy_addresses(self, addresses):
+        """将指定的代理行从禁用状态移除（移除 # 前缀）"""
+        addresses = {
+            normalize_proxy_address(addr).lstrip('#')
+            for addr in addresses
+            if addr
+        }
+        if not addresses:
+            return 0
+
+        with self._proxy_file_lock:
+            if not os.path.exists(self.proxy_file):
+                return 0
+            with open(self.proxy_file, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+
+            changed = 0
+            updated = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped and stripped.startswith('#'):
+                    normalized = normalize_proxy_address(stripped[1:])
+                    if normalized in addresses:
+                        updated.append(stripped[1:])
+                        changed += 1
+                        continue
+                updated.append(line)
+
+            if not changed:
+                return 0
+
+            directory = os.path.dirname(os.path.abspath(self.proxy_file))
+            fd, temp_path = tempfile.mkstemp(prefix='.proxycat-', dir=directory, text=True)
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+                    f.write('\n'.join(updated) + '\n')
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, self.proxy_file)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+            self.proxies = self.load_all_proxies()
+            self.proxy_cycle = cycle(self.proxies) if self.proxies else None
+            if self.proxies:
+                self.current_proxy = next(self.proxy_cycle)
+            logging.info(f'自动重新启用 {changed} 个代理')
+            return changed
+
     async def _run_auto_check(self):
         if self.use_getip or not self.auto_check_enabled:
             return
         async with self._auto_check_lock:
-            enabled_proxies = list(self.proxies)
-            if not enabled_proxies:
+            all_proxies = self.load_all_proxies()
+            if not all_proxies:
                 self._last_auto_check_summary = {
-                    'checked': 0, 'valid': 0, 'failed': 0, 'disabled': 0
+                    'checked': 0, 'valid': 0, 'failed': 0, 'disabled': 0, 're_enabled': 0
                 }
                 return
 
@@ -298,8 +369,8 @@ class AsyncProxyServer:
                         timeout_ms=self.proxy_check_timeout_ms,
                     )
 
-            results = await asyncio.gather(*(probe(proxy) for proxy in enabled_proxies))
-            failed = [proxy for proxy, result in results if not result.get('valid')]
+            results = await asyncio.gather(*(probe(proxy) for proxy in all_proxies))
+
             try:
                 from modules.modules import record_ui_check_result, append_ui_check_log
                 for proxy, result in results:
@@ -307,9 +378,17 @@ class AsyncProxyServer:
             except Exception as e:
                 logging.debug(f'record auto-check UI results failed: {e}')
 
+            failed = [proxy for proxy, result in results if not result.get('valid')]
             disabled = 0
-            if self.auto_disable_failed_proxies and failed:
+            re_enabled = 0
+
+            if failed:
                 disabled = self.disable_proxy_addresses(failed)
+
+            # 重新启用检测成功的代理（即使之前被禁用）
+            valid_proxies = [p for p, result in results if result.get('valid')]
+            if valid_proxies:
+                re_enabled = self.enable_proxy_addresses(valid_proxies)
 
             self._last_auto_check_at = time.time()
             self._last_auto_check_summary = {
@@ -317,10 +396,13 @@ class AsyncProxyServer:
                 'valid': len(results) - len(failed),
                 'failed': len(failed),
                 'disabled': disabled,
+                're_enabled': re_enabled
             }
+
             summary_msg = (
                 f'自动代理检测完成: 检测 {len(results)}，'
-                f'成功 {len(results) - len(failed)}，失败 {len(failed)}，禁用 {disabled}'
+                f'成功 {len(results) - len(failed)}，失败 {len(failed)}，'
+                f'禁用 {disabled}，重新启用 {re_enabled}'
             )
             logging.info(summary_msg)
             try:

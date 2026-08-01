@@ -87,7 +87,10 @@ docker-compose down | docker-compose up -d
 # 查看日志信息
 docker logs proxycat
 
-# docker端口默认为1080和5000,1080为监听端口，5000为web页面管理如需其他端口请对应修改并放行
+# docker端口默认为1080和5000,1080为监听端口，5000为web页面管理
+# 如需改端口/额外挂载等，请复制 docker-compose.override.yml.example
+# 为 docker-compose.override.yml 后修改（该文件不会被 git pull 覆盖）
+# cp docker-compose.override.yml.example docker-compose.override.yml
 ```
 
 ### 配置文件介绍
